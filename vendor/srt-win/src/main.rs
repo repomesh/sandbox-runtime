@@ -93,10 +93,11 @@ enum WfpCmd {
         sublayer_guid: Option<String>,
     },
     /// Print WFP fence state for one user as JSON:
-    /// `{state, filters}`.
+    /// `{state, filters}`. Filters are identified by their
+    /// `providerData` tag, so only `--user-sid` and
+    /// `--sublayer-guid` are relevant — group resolution is not
+    /// needed.
     Status {
-        #[command(flatten)]
-        group: GroupRef,
         #[arg(long)]
         user_sid: Option<String>,
         #[arg(long)]
@@ -132,8 +133,17 @@ fn run() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
 
+    // Validate a caller-supplied SID string up front so a typo
+    // surfaces as "invalid --<flag>" rather than an SDDL parse error
+    // three calls deep.
+    let validate_sid = |flag: &str, s: &str| -> anyhow::Result<()> {
+        sid::LocalPsid::from_string(s)
+            .map(|_| ())
+            .with_context(|| format!("invalid --{flag} '{s}'"))
+    };
     let resolve_group_sid = |g: &GroupRef| -> anyhow::Result<String> {
         if let Some(s) = &g.group_sid {
+            validate_sid("group-sid", s)?;
             return Ok(s.clone());
         }
         sid::lookup_account_sid(&g.name)
@@ -141,7 +151,10 @@ fn run() -> anyhow::Result<()> {
     };
     let resolve_user_sid = |u: &Option<String>| -> anyhow::Result<String> {
         match u {
-            Some(s) => Ok(s.clone()),
+            Some(s) => {
+                validate_sid("user-sid", s)?;
+                Ok(s.clone())
+            }
             None => sid::current_user_sid().context("resolve current user"),
         }
     };
@@ -257,7 +270,7 @@ fn run() -> anyhow::Result<()> {
             );
         }
         Cmd::Wfp {
-            sub: WfpCmd::Status { group: _, user_sid, sublayer_guid },
+            sub: WfpCmd::Status { user_sid, sublayer_guid },
         } => {
             let user = resolve_user_sid(&user_sid)?;
             let sl = resolve_sublayer(&sublayer_guid)?;
