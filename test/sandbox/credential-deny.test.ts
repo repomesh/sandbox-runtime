@@ -12,8 +12,12 @@ import { join } from 'node:path'
 import { SandboxManager } from '../../src/sandbox/sandbox-manager.js'
 import type { SandboxRuntimeConfig } from '../../src/sandbox/sandbox-config.js'
 import { wrapCommandWithSandboxMacOS } from '../../src/sandbox/macos-sandbox-utils.js'
-import { DANGEROUS_CREDENTIAL_PATHS } from '../../src/sandbox/sandbox-utils.js'
-import { isLinux, isSupportedPlatform } from '../helpers/platform.js'
+import {
+  DANGEROUS_CREDENTIAL_PATHS,
+  normalizePathForSandbox,
+} from '../../src/sandbox/sandbox-utils.js'
+import { loadConfig } from '../../src/utils/config-loader.js'
+import { isLinux, isMacOS, isSupportedPlatform } from '../helpers/platform.js'
 
 /**
  * Tests for the `credentials` config section (mode: deny / allow).
@@ -216,6 +220,198 @@ describe('macOS env -u preamble generation', () => {
     })
 
     expect(wrapped).not.toContain(' -u ')
+  })
+})
+
+/**
+ * Drive the same pipeline the CLI uses on macOS — settings file → loadConfig →
+ * SandboxManager.initialize → wrapWithSandbox — with process.platform forced
+ * to 'darwin' so the macOS branch is exercised on Linux CI too. Asserts the
+ * credential restrictions actually reach the final wrapped command.
+ */
+describe.if(isSupportedPlatform)(
+  'macOS wrapped command via the manager (settings-file config)',
+  () => {
+    const TEST_DIR = join(tmpdir(), 'credential-deny-darwin-' + Date.now())
+    const SECRET_FILE = join(TEST_DIR, 'secret-token.txt')
+    const SETTINGS_FILE = join(TEST_DIR, 'credentials.json')
+    let platformDescriptor: PropertyDescriptor | undefined
+
+    const escapeRegExp = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    // Matches a (deny file-read* (subpath "<path>")) rule; the inner quotes
+    // may be backslash-escaped because the profile is shell-quoted into the
+    // wrapped command.
+    const denyReadRule = (p: string) =>
+      new RegExp(
+        String.raw`\(deny file-read\*\s+\(subpath \\?"` + escapeRegExp(p),
+      )
+
+    beforeAll(async () => {
+      mkdirSync(TEST_DIR, { recursive: true })
+      writeFileSync(SECRET_FILE, 'token-abc\n')
+      writeFileSync(
+        SETTINGS_FILE,
+        JSON.stringify({
+          network: { allowedDomains: [], deniedDomains: [] },
+          filesystem: { denyRead: [], allowWrite: ['.'], denyWrite: [] },
+          credentials: {
+            files: [{ path: SECRET_FILE, mode: 'deny' }],
+            envVars: [{ name: 'MY_API_TOKEN', mode: 'deny' }],
+          },
+        }),
+      )
+
+      platformDescriptor = Object.getOwnPropertyDescriptor(process, 'platform')
+      Object.defineProperty(process, 'platform', { value: 'darwin' })
+
+      const config = loadConfig(SETTINGS_FILE)
+      if (!config) {
+        throw new Error(`Settings file failed to load: ${SETTINGS_FILE}`)
+      }
+      await SandboxManager.reset()
+      await SandboxManager.initialize(config)
+    })
+
+    afterAll(async () => {
+      await SandboxManager.reset()
+      if (platformDescriptor) {
+        Object.defineProperty(process, 'platform', platformDescriptor)
+      }
+      if (existsSync(TEST_DIR)) {
+        rmSync(TEST_DIR, { recursive: true, force: true })
+      }
+    })
+
+    it('unsets the denied env var before assignments and sandbox-exec', async () => {
+      const wrapped = await SandboxManager.wrapWithSandbox(
+        'printenv MY_API_TOKEN',
+      )
+
+      expect(wrapped.startsWith('env -u MY_API_TOKEN ')).toBe(true)
+      // -u must precede the first NAME=VALUE assignment and sandbox-exec so
+      // BSD env still treats it as an option.
+      expect(wrapped.indexOf('-u MY_API_TOKEN')).toBeLessThan(
+        wrapped.indexOf('SANDBOX_RUNTIME'),
+      )
+      expect(wrapped.indexOf('-u MY_API_TOKEN')).toBeLessThan(
+        wrapped.indexOf('sandbox-exec'),
+      )
+    })
+
+    it('denies reads of the declared credential file and the defaults in the profile', async () => {
+      const wrapped = await SandboxManager.wrapWithSandbox(`cat ${SECRET_FILE}`)
+
+      expect(wrapped).toContain('sandbox-exec')
+      expect(wrapped).toMatch(
+        denyReadRule(normalizePathForSandbox(SECRET_FILE)),
+      )
+      expect(wrapped).toMatch(denyReadRule(normalizePathForSandbox('~/.netrc')))
+    })
+  },
+)
+
+/**
+ * macOS end-to-end: actually run sandbox-exec with a settings-file config and
+ * verify the credential deny rules hold at runtime. Skipped on Linux; runs on
+ * the macOS CI legs.
+ */
+describe.if(isMacOS)('credential deny on macOS (sandbox-exec)', () => {
+  const TEST_DIR = join(tmpdir(), 'credential-deny-macos-' + Date.now())
+  const SECRET_FILE = join(TEST_DIR, 'secret-token.txt')
+  const CONTROL_FILE = join(TEST_DIR, 'control.txt')
+  const SETTINGS_FILE = join(TEST_DIR, 'credentials.json')
+  const DENIED_ENV_VAR = 'SRT_TEST_SECRET_TOKEN'
+  const ALLOWED_ENV_VAR = 'SRT_TEST_VISIBLE_VALUE'
+
+  // process.env mutations don't reach children spawned by bun without an
+  // explicit env option, so the credential vars are passed per-spawn instead.
+  const childEnv = {
+    ...process.env,
+    [DENIED_ENV_VAR]: 'super-secret-value',
+    [ALLOWED_ENV_VAR]: 'visible-value',
+  }
+
+  function runInSandbox(wrappedCommand: string) {
+    return spawnSync(wrappedCommand, {
+      shell: true,
+      encoding: 'utf8',
+      timeout: 10000,
+      env: childEnv,
+    })
+  }
+
+  beforeAll(async () => {
+    mkdirSync(TEST_DIR, { recursive: true })
+    writeFileSync(SECRET_FILE, 'token-abc\n')
+    writeFileSync(CONTROL_FILE, 'control-ok\n')
+    writeFileSync(
+      SETTINGS_FILE,
+      JSON.stringify({
+        network: { allowedDomains: [], deniedDomains: [] },
+        filesystem: {
+          denyRead: [],
+          allowWrite: [TEST_DIR, '/tmp'],
+          denyWrite: [],
+        },
+        credentials: {
+          files: [{ path: SECRET_FILE, mode: 'deny' }],
+          envVars: [{ name: DENIED_ENV_VAR, mode: 'deny' }],
+        },
+      }),
+    )
+
+    const config = loadConfig(SETTINGS_FILE)
+    if (!config) {
+      throw new Error(`Settings file failed to load: ${SETTINGS_FILE}`)
+    }
+    await SandboxManager.reset()
+    await SandboxManager.initialize(config)
+  })
+
+  afterAll(async () => {
+    await SandboxManager.reset()
+    if (existsSync(TEST_DIR)) {
+      rmSync(TEST_DIR, { recursive: true, force: true })
+    }
+  })
+
+  it('a denied env var is absent inside the sandbox', async () => {
+    const wrapped = await SandboxManager.wrapWithSandbox(
+      `printenv ${DENIED_ENV_VAR}`,
+    )
+    const result = runInSandbox(wrapped)
+
+    expect(result.status).not.toBe(0)
+    expect(result.stdout).not.toContain('super-secret-value')
+  })
+
+  it('a non-denied env var is still inherited inside the sandbox', async () => {
+    const wrapped = await SandboxManager.wrapWithSandbox(
+      `printenv ${ALLOWED_ENV_VAR}`,
+    )
+    const result = runInSandbox(wrapped)
+
+    expect(result.status).toBe(0)
+    expect(result.stdout).toContain('visible-value')
+  })
+
+  it('a denied credential file is unreadable inside the sandbox', async () => {
+    const wrapped = await SandboxManager.wrapWithSandbox(`cat ${SECRET_FILE}`)
+    const result = runInSandbox(wrapped)
+
+    expect(result.status).not.toBe(0)
+    expect(result.stdout).not.toContain('token-abc')
+    expect((result.stderr || '').toLowerCase()).toContain(
+      'operation not permitted',
+    )
+  })
+
+  it('a non-credential file in the same directory is still readable', async () => {
+    const wrapped = await SandboxManager.wrapWithSandbox(`cat ${CONTROL_FILE}`)
+    const result = runInSandbox(wrapped)
+
+    expect(result.status).toBe(0)
+    expect(result.stdout).toContain('control-ok')
   })
 })
 
