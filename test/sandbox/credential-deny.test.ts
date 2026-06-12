@@ -12,10 +12,7 @@ import { join } from 'node:path'
 import { SandboxManager } from '../../src/sandbox/sandbox-manager.js'
 import type { SandboxRuntimeConfig } from '../../src/sandbox/sandbox-config.js'
 import { wrapCommandWithSandboxMacOS } from '../../src/sandbox/macos-sandbox-utils.js'
-import {
-  DANGEROUS_CREDENTIAL_PATHS,
-  normalizePathForSandbox,
-} from '../../src/sandbox/sandbox-utils.js'
+import { normalizePathForSandbox } from '../../src/sandbox/sandbox-utils.js'
 import { loadConfig } from '../../src/utils/config-loader.js'
 import { isLinux, isMacOS, isSupportedPlatform } from '../helpers/platform.js'
 
@@ -23,9 +20,9 @@ import { isLinux, isMacOS, isSupportedPlatform } from '../helpers/platform.js'
  * Tests for the `credentials` config section (mode: deny / allow).
  *
  * File entries with mode: deny are unioned into the read-deny set; env var
- * entries with mode: deny are unset inside the sandbox. The
- * DANGEROUS_CREDENTIAL_PATHS defaults apply only when a `credentials` block
- * is present, and an explicit mode: allow entry exempts the matching default.
+ * entries with mode: deny are unset inside the sandbox. Only explicitly
+ * declared sources are restricted — the block applies no implicit defaults,
+ * and mode: allow is currently a no-op reserved for future semantics.
  */
 
 function baseConfig(
@@ -45,7 +42,7 @@ describe.if(isSupportedPlatform)(
       await SandboxManager.reset()
     })
 
-    it('does not apply DANGEROUS_CREDENTIAL_PATHS without a credentials block', async () => {
+    it('applies only caller-supplied denyRead without a credentials block', async () => {
       await SandboxManager.reset()
       await SandboxManager.initialize(
         baseConfig({
@@ -63,18 +60,20 @@ describe.if(isSupportedPlatform)(
       await SandboxManager.reset()
     })
 
-    it('applies DANGEROUS_CREDENTIAL_PATHS when a credentials block is present', async () => {
+    it('denies nothing beyond the declared entries', async () => {
       await SandboxManager.reset()
+      // Only an env var deny is declared — no implicit file read-denies
+      // (e.g. ~/.netrc) may appear.
       await SandboxManager.initialize(
         baseConfig({
-          credentials: {},
+          credentials: {
+            envVars: [{ name: 'GH_TOKEN', mode: 'deny' }],
+          },
         }),
       )
 
       const readConfig = SandboxManager.getFsReadConfig()
-      for (const defaultPath of DANGEROUS_CREDENTIAL_PATHS) {
-        expect(readConfig.denyOnly).toContain(defaultPath)
-      }
+      expect(readConfig.denyOnly).toEqual([])
 
       await SandboxManager.reset()
     })
@@ -95,31 +94,29 @@ describe.if(isSupportedPlatform)(
       )
 
       const readConfig = SandboxManager.getFsReadConfig()
-      // Caller denyRead survives, credential deny entry and defaults are added
+      // Caller denyRead survives and the credential deny entry is added
       expect(readConfig.denyOnly).toContain('/some/secret')
       expect(readConfig.denyOnly).toContain('~/.config/gcloud')
-      expect(readConfig.denyOnly).toContain('~/.netrc')
 
       await SandboxManager.reset()
     })
 
-    it('exempts a default path with an explicit mode: allow entry', async () => {
+    it('mode: allow entries add no read-deny', async () => {
       await SandboxManager.reset()
       await SandboxManager.initialize(
         baseConfig({
           credentials: {
-            // Spelled as an absolute path to verify the exemption matches
-            // after path normalization, not by string equality with '~/.aws'.
-            files: [{ path: join(homedir(), '.aws'), mode: 'allow' }],
+            files: [
+              { path: join(homedir(), '.aws'), mode: 'allow' },
+              { path: '~/.netrc', mode: 'deny' },
+            ],
           },
         }),
       )
 
       const readConfig = SandboxManager.getFsReadConfig()
-      expect(readConfig.denyOnly).not.toContain('~/.aws')
-      // The other defaults are still applied
-      expect(readConfig.denyOnly).toContain('~/.ssh')
-      expect(readConfig.denyOnly).toContain('~/.netrc')
+      // Only the deny entry lands in the read-deny set; allow is a no-op.
+      expect(readConfig.denyOnly).toEqual(['~/.netrc'])
 
       await SandboxManager.reset()
     })
@@ -166,7 +163,6 @@ describe.if(isSupportedPlatform)(
 
       expect(wrapped).toContain('deny file-read*')
       expect(wrapped).toContain('.netrc')
-      expect(wrapped).toContain('.config/gh')
 
       await SandboxManager.reset()
     })
@@ -298,14 +294,17 @@ describe.if(isSupportedPlatform)(
       )
     })
 
-    it('denies reads of the declared credential file and the defaults in the profile', async () => {
+    it('denies reads of the declared credential file in the profile', async () => {
       const wrapped = await SandboxManager.wrapWithSandbox(`cat ${SECRET_FILE}`)
 
       expect(wrapped).toContain('sandbox-exec')
       expect(wrapped).toMatch(
         denyReadRule(normalizePathForSandbox(SECRET_FILE)),
       )
-      expect(wrapped).toMatch(denyReadRule(normalizePathForSandbox('~/.netrc')))
+      // No implicit denies: undeclared credential paths stay out of the profile.
+      expect(wrapped).not.toMatch(
+        denyReadRule(normalizePathForSandbox('~/.netrc')),
+      )
     })
   },
 )

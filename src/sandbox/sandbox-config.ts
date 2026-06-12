@@ -116,9 +116,10 @@ const ParentProxyConfigSchema = z.object({
  *
  * - `deny` — the sandboxed process cannot read the file / does not see the
  *   environment variable.
- * - `allow` — SRT adds no restriction for that source, and the entry exempts
- *   the matching path from the default credential deny list
- *   (DANGEROUS_CREDENTIAL_PATHS in sandbox-utils.ts).
+ * - `allow` — currently a no-op: SRT applies no default credential
+ *   protections, so there is nothing for an `allow` entry to exempt. The
+ *   mode is reserved for future semantics (opting a source out of default
+ *   protections or credential masking, should those ship).
  * - `mask` — reserved for credential masking; rejected until masking ships.
  */
 const credentialModeSchema = z
@@ -170,13 +171,12 @@ export const CredentialEnvVarConfigSchema = z.object({
  * per-source mode:
  * - `deny` blocks the source inside the sandbox (file reads are denied via the
  *   filesystem read-deny mechanism, env vars are unset in the child).
- * - `allow` adds no restriction for that source AND exempts the matching path
- *   from the default credential deny list (DANGEROUS_CREDENTIAL_PATHS). It
+ * - `allow` is currently a no-op — there are no default credential
+ *   protections to exempt from. It is reserved for future semantics and
  *   never overrides an explicit filesystem.denyRead or `mode: "deny"` entry.
  *
- * When this section is present, the DANGEROUS_CREDENTIAL_PATHS defaults are
- * also denied for reads. Configs without a `credentials` section behave
- * exactly as before this section existed.
+ * Only the sources declared here are affected; the section applies no
+ * implicit restrictions beyond them.
  */
 export const CredentialsConfigSchema = z.object({
   files: z
@@ -382,8 +382,8 @@ export const SandboxRuntimeConfigSchema = z.object({
     'Filesystem restrictions configuration',
   ),
   credentials: CredentialsConfigSchema.optional().describe(
-    'Credential handling configuration. When present, the default credential ' +
-      'store paths (DANGEROUS_CREDENTIAL_PATHS) are also denied for reads.',
+    'Credential handling configuration. Only the explicitly declared files ' +
+      'and environment variables are restricted.',
   ),
   ignoreViolations: IgnoreViolationsConfigSchema.optional().describe(
     'Optional configuration for ignoring specific violations',

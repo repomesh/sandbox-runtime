@@ -27,27 +27,6 @@ export const DANGEROUS_FILES = [
 export const DANGEROUS_DIRECTORIES = ['.git', '.vscode', '.idea'] as const
 
 /**
- * Default credential store paths that should be protected from READS.
- * These locations commonly hold long-lived secrets (cloud keys, SSH keys,
- * registry tokens) that a sandboxed process rarely needs to read directly.
- *
- * Only applied when the config contains a `credentials` section — configs
- * without one keep the default-allow read behavior, so existing callers see
- * no change. An explicit `{path, mode: "allow"}` credentials entry exempts
- * the matching default.
- */
-export const DANGEROUS_CREDENTIAL_PATHS = [
-  '~/.aws',
-  '~/.ssh',
-  '~/.netrc',
-  '~/.config/gh',
-  '~/.docker',
-  '~/.kube',
-  '~/.npmrc',
-  '~/.pypirc',
-] as const
-
-/**
  * Get the list of dangerous directories to deny writes to.
  * Excludes .git since we need it writable for git operations -
  * instead we block specific paths within .git (hooks and config).

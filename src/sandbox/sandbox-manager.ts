@@ -35,8 +35,6 @@ import {
   containsGlobChars,
   removeTrailingGlobSuffix,
   expandGlobPattern,
-  normalizePathForSandbox,
-  DANGEROUS_CREDENTIAL_PATHS,
 } from './sandbox-utils.js'
 import { SandboxViolationStore } from './sandbox-violation-store.js'
 import {
@@ -433,11 +431,10 @@ function checkDependencies(ripgrepConfig?: {
 /**
  * Build the read-deny / env-unset sets implied by the `credentials` config.
  *
- * The DANGEROUS_CREDENTIAL_PATHS defaults are included only when a
- * `credentials` section is present, so configs without one keep today's
- * default-allow read behavior. An explicit `mode: 'allow'` file entry exempts
- * the matching default (compared after path normalization); it never weakens
- * caller-supplied filesystem.denyRead or `mode: 'deny'` entries.
+ * Only explicitly declared sources are restricted: `mode: 'deny'` file
+ * entries join the read-deny set and `mode: 'deny'` env vars are unset.
+ * `mode: 'allow'` entries currently add no restriction and exempt nothing —
+ * the mode is reserved for future default-protection/masking semantics.
  */
 function getCredentialRestrictions(
   credentials: CredentialsConfig | undefined,
@@ -447,17 +444,7 @@ function getCredentialRestrictions(
   }
 
   const files = credentials.files ?? []
-  const allowedPaths = new Set(
-    files
-      .filter(f => f.mode === 'allow')
-      .map(f => normalizePathForSandbox(f.path)),
-  )
-  const denyReadPaths = [
-    ...files.filter(f => f.mode === 'deny').map(f => f.path),
-    ...DANGEROUS_CREDENTIAL_PATHS.filter(
-      p => !allowedPaths.has(normalizePathForSandbox(p)),
-    ),
-  ]
+  const denyReadPaths = files.filter(f => f.mode === 'deny').map(f => f.path)
 
   const unsetEnvVars = (credentials.envVars ?? [])
     .filter(v => v.mode === 'deny')
