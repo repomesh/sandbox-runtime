@@ -823,4 +823,121 @@ describe('allowWrite glob suffix handling', () => {
       }
     },
   )
+
+  // Regression: a directory in both denyRead and denyWrite (e.g. ~/.ssh with
+  // Read + Edit/Write deny rules), under an allowed write root, got its
+  // denyWrite --ro-bind <dir> <dir> emitted after its own denyRead --tmpfs,
+  // exposing the real contents read-only. The tmpfs alone enforces both
+  // denies: contents hidden, writes land in the ephemeral tmpfs.
+  it.if(isLinux)(
+    'denyWrite bind does not re-expose a denyRead tmpfs over the same dir (Linux)',
+    async () => {
+      const parentDir = join(tmpdir(), `srt-test-dir-both-${Date.now()}`)
+      const sshDir = join(parentDir, '.ssh')
+      mkdirSync(sshDir, { recursive: true })
+      writeFileSync(join(sshDir, 'id_rsa'), '')
+
+      try {
+        await SandboxManager.reset()
+        await SandboxManager.initialize({
+          network: { allowedDomains: [], deniedDomains: [] },
+          filesystem: {
+            denyRead: [sshDir],
+            allowWrite: [parentDir],
+            denyWrite: [sshDir],
+          },
+        })
+
+        const result = await SandboxManager.wrapWithSandbox(command)
+
+        // The tmpfs is what we want; the host-dir bind is what we don't.
+        expect(result).toContain(`--tmpfs ${sshDir}`)
+        expect(result).not.toContain(`--ro-bind ${sshDir} ${sshDir}`)
+      } finally {
+        await SandboxManager.reset()
+        rmSync(parentDir, { recursive: true, force: true })
+      }
+    },
+  )
+
+  // The ancestor variant of the same stacking bug: a denyWrite dir that
+  // contains a denyRead dir re-exposes it when the write-deny ro-bind lands
+  // after the tmpfs. The tmpfs must be re-applied on top.
+  it.if(isLinux)(
+    'denyRead tmpfs survives a denyWrite bind over an ancestor dir (Linux)',
+    async () => {
+      const parentDir = join(tmpdir(), `srt-test-dir-ancestor-${Date.now()}`)
+      const secretsDir = join(parentDir, 'secrets')
+      const innerDir = join(secretsDir, 'inner')
+      mkdirSync(innerDir, { recursive: true })
+      writeFileSync(join(innerDir, 'key.pem'), '')
+
+      try {
+        await SandboxManager.reset()
+        await SandboxManager.initialize({
+          network: { allowedDomains: [], deniedDomains: [] },
+          filesystem: {
+            denyRead: [innerDir],
+            allowWrite: [parentDir],
+            denyWrite: [secretsDir],
+          },
+        })
+
+        const result = await SandboxManager.wrapWithSandbox(command)
+
+        // The write-deny bind on the ancestor stays, and the read-deny tmpfs
+        // must land after it in arg order so the kernel stacks it on top.
+        const bindAt = result.indexOf(`--ro-bind ${secretsDir} ${secretsDir}`)
+        const tmpfsAt = result.lastIndexOf(`--tmpfs ${innerDir}`)
+        expect(bindAt).toBeGreaterThan(-1)
+        expect(tmpfsAt).toBeGreaterThan(bindAt)
+      } finally {
+        await SandboxManager.reset()
+        rmSync(parentDir, { recursive: true, force: true })
+      }
+    },
+  )
+
+  // The #190 case must keep working: a denyRead tmpfs over an ancestor of an
+  // allowed write path wipes denyWrite binds under that write path; they are
+  // restored by emitting denyWrite after the denyRead re-binds. The tmpfs
+  // skip above must not drop them — the write path re-bind re-exposed them.
+  it.if(isLinux)(
+    'denyWrite under a re-bound write path survives an ancestor denyRead tmpfs (Linux)',
+    async () => {
+      const parentDir = join(tmpdir(), `srt-test-190-${Date.now()}`)
+      const projectDir = join(parentDir, 'project')
+      const hooksDir = join(projectDir, 'hooks')
+      mkdirSync(hooksDir, { recursive: true })
+
+      try {
+        await SandboxManager.reset()
+        await SandboxManager.initialize({
+          network: { allowedDomains: [], deniedDomains: [] },
+          filesystem: {
+            denyRead: [parentDir],
+            allowWrite: [projectDir],
+            denyWrite: [hooksDir],
+          },
+        })
+
+        const result = await SandboxManager.wrapWithSandbox(command)
+
+        // Order must be: tmpfs ancestor → re-bind write path → deny hooks.
+        // The write path is bound twice (allowWrite, then the re-bind after
+        // the tmpfs wiped it) — the re-bind is the last occurrence.
+        const tmpfsAt = result.indexOf(`--tmpfs ${parentDir}`)
+        const rebindAt = result.lastIndexOf(
+          `--bind ${projectDir} ${projectDir}`,
+        )
+        const denyAt = result.indexOf(`--ro-bind ${hooksDir} ${hooksDir}`)
+        expect(tmpfsAt).toBeGreaterThan(-1)
+        expect(rebindAt).toBeGreaterThan(tmpfsAt)
+        expect(denyAt).toBeGreaterThan(rebindAt)
+      } finally {
+        await SandboxManager.reset()
+        rmSync(parentDir, { recursive: true, force: true })
+      }
+    },
+  )
 })
