@@ -372,8 +372,9 @@ describe.if(isLinux)('env masking on Linux (bwrap)', () => {
     await SandboxManager.reset()
     await SandboxManager.initialize(
       baseConfig({
-        // injectHosts is unused (this block tests env-side masking only)
-        // but required by the schema for any masked env var.
+        // injectHosts is unused here (this block tests env-side masking
+        // only); set explicitly so the registry's per-credential host
+        // gating is exercised independent of allowedDomains.
         network: { allowedDomains: ['localhost'], deniedDomains: [] },
         credentials: {
           envVars: [{ name: MASKED_VAR, mode: 'mask' }],
@@ -706,6 +707,116 @@ describe.if(isLinux)('per-credential injectHosts via SandboxManager', () => {
     expect(npmHeaders?.authorization).not.toContain(GH_REAL)
   }, 20000)
 })
+
+/**
+ * No injectHosts at either level → defaults to network.allowedDomains.
+ * injectHosts is an optional narrowing; absent it, the credential is
+ * injectable at *every* host the sandbox can reach. The second test
+ * makes the security implication explicit.
+ */
+describe.if(isLinux)(
+  'injectHosts defaults to allowedDomains via SandboxManager',
+  () => {
+    const VAR = 'SRT_TEST_DEFAULT_TOKEN'
+    const REAL = 'default-real-secret'
+    const HOST_A = 'localhost'
+    const HOST_B = 'localtest.me'
+
+    let upA: Server, portA: number, hdrA: IncomingHttpHeaders | undefined
+    let upB: Server, portB: number, hdrB: IncomingHttpHeaders | undefined
+
+    beforeAll(async () => {
+      upA = createHttpServer((req, res) => {
+        hdrA = req.headers
+        res.writeHead(200)
+        res.end('ok')
+      })
+      upB = createHttpServer((req, res) => {
+        hdrB = req.headers
+        res.writeHead(200)
+        res.end('ok')
+      })
+      await new Promise<void>(r => upA.listen(0, '127.0.0.1', () => r()))
+      await new Promise<void>(r => upB.listen(0, '127.0.0.1', () => r()))
+      portA = (upA.address() as AddressInfo).port
+      portB = (upB.address() as AddressInfo).port
+    })
+
+    afterAll(async () => {
+      await SandboxManager.reset()
+      delete process.env[VAR]
+      await new Promise<void>(r => upA.close(() => r()))
+      await new Promise<void>(r => upB.close(() => r()))
+    })
+
+    test('with no injectHosts, sentinel swaps at the sole allowedDomain', async () => {
+      process.env[VAR] = REAL
+      await SandboxManager.reset()
+      await SandboxManager.initialize({
+        network: { allowedDomains: [HOST_A], deniedDomains: [] },
+        filesystem: { denyRead: [], allowWrite: ['/tmp'], denyWrite: [] },
+        credentials: {
+          envVars: [{ name: VAR, mode: 'mask' }],
+          // No injectHosts at either level.
+          allowPlaintextInject: true,
+        },
+      })
+      await SandboxManager.wrapWithSandbox('true')
+      const sentinel = [...SandboxManager.getSentinelRegistry().entries()].find(
+        ([, r]) => r === REAL,
+      )![0]
+      const proxyPort = SandboxManager.getProxyPort()!
+      const authToken = SandboxManager.getProxyAuthToken()!
+
+      hdrA = undefined
+      const r = await curlViaProxy(proxyPort, `http://${HOST_A}:${portA}/`, {
+        headers: ['Authorization: Bearer ' + sentinel],
+        proxyAuth: `srt:${authToken}`,
+      })
+      expect(r.exit).toBe(0)
+      expect(hdrA?.authorization).toBe(`Bearer ${REAL}`)
+    }, 20000)
+
+    test('without injectHosts, credential is injected at every allowedDomain', async () => {
+      // Security trade-off made explicit: two reachable hosts, no
+      // narrowing → the real value goes to BOTH. A credential intended
+      // for one host must set injectHosts to keep it from the other.
+      process.env[VAR] = REAL
+      await SandboxManager.reset()
+      await SandboxManager.initialize({
+        network: { allowedDomains: [HOST_A, HOST_B], deniedDomains: [] },
+        filesystem: { denyRead: [], allowWrite: ['/tmp'], denyWrite: [] },
+        credentials: {
+          envVars: [{ name: VAR, mode: 'mask' }],
+          allowPlaintextInject: true,
+        },
+      })
+      await SandboxManager.wrapWithSandbox('true')
+      const sentinel = [...SandboxManager.getSentinelRegistry().entries()].find(
+        ([, r]) => r === REAL,
+      )![0]
+      const proxyPort = SandboxManager.getProxyPort()!
+      const authToken = SandboxManager.getProxyAuthToken()!
+
+      hdrA = undefined
+      const ra = await curlViaProxy(proxyPort, `http://${HOST_A}:${portA}/`, {
+        headers: ['Authorization: Bearer ' + sentinel],
+        proxyAuth: `srt:${authToken}`,
+      })
+      expect(ra.exit).toBe(0)
+      expect(hdrA?.authorization).toBe(`Bearer ${REAL}`)
+
+      hdrB = undefined
+      const rb = await curlViaProxy(proxyPort, `http://${HOST_B}:${portB}/`, {
+        headers: ['Authorization: Bearer ' + sentinel],
+        proxyAuth: `srt:${authToken}`,
+        resolve: `${HOST_B}:${portB}:127.0.0.1`,
+      })
+      expect(rb.exit).toBe(0)
+      expect(hdrB?.authorization).toBe(`Bearer ${REAL}`)
+    }, 20000)
+  },
+)
 
 type CurlResult = {
   exit: number

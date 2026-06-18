@@ -457,27 +457,25 @@ describe('Config Validation', () => {
       expect(result.success).toBe(true)
     })
 
-    test('rejects a masked env var with no effective injectHosts', () => {
-      // Neither per-entry nor block-level — the credential would be masked
-      // but never injected anywhere.
+    test('accepts a masked env var with no injectHosts (defaults to allowedDomains)', () => {
+      // Neither per-entry nor block-level injectHosts — the credential
+      // defaults to network.allowedDomains (injection at every reachable
+      // host). injectHosts is now an optional narrowing.
       const result = SandboxRuntimeConfigSchema.safeParse({
         ...base,
-        network: { ...base.network, tlsTerminate: {} },
+        network: {
+          allowedDomains: ['api.github.com'],
+          deniedDomains: [],
+          tlsTerminate: {},
+        },
         credentials: {
           envVars: [{ name: 'GH_TOKEN', mode: 'mask' }],
         },
       })
-      expect(result.success).toBe(false)
-      if (!result.success) {
-        const issue = result.error.issues.find(
-          i => i.path.join('.') === 'credentials.envVars.0',
-        )
-        expect(issue?.message).toContain('requires injectHosts')
-        expect(issue?.message).toContain('masked but never injected')
-      }
+      expect(result.success).toBe(true)
     })
 
-    test('rejects a masked env var whose per-entry injectHosts is empty', () => {
+    test('rejects a masked env var whose per-entry injectHosts is explicitly empty', () => {
       const result = SandboxRuntimeConfigSchema.safeParse({
         ...base,
         network: {
@@ -490,12 +488,13 @@ describe('Config Validation', () => {
           injectHosts: ['api.github.com'],
         },
       })
-      // An explicit empty list is an override, not "inherit", so it fails
-      // the non-empty check.
+      // An explicit empty list is an override, not "inherit" — it would
+      // mean "mask but never inject", which is self-contradictory.
       expect(result.success).toBe(false)
       if (!result.success) {
         const messages = result.error.issues.map(i => i.message).join('\n')
-        expect(messages).toContain('requires injectHosts')
+        expect(messages).toContain('explicitly empty')
+        expect(messages).toContain('masked but never injected')
       }
     })
 

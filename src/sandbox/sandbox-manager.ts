@@ -604,6 +604,7 @@ function checkDependencies(ripgrepConfig?: {
  */
 function getCredentialRestrictions(
   credentials: CredentialsConfig | undefined,
+  allowedDomains: readonly string[] | undefined,
 ): CredentialRestrictionConfig {
   if (!credentials) {
     return { denyReadPaths: [], unsetEnvVars: [], setEnvVars: {} }
@@ -620,9 +621,14 @@ function getCredentialRestrictions(
     } else if (v.mode === 'mask') {
       const real = process.env[v.name]
       if (real === undefined) continue
-      // A per-entry injectHosts overrides the block-level default; the
-      // schema guarantees at least one of them is non-empty.
-      const injectHosts = v.injectHosts ?? credentials.injectHosts ?? []
+      // Effective injectHosts: per-entry overrides block-level; if neither
+      // is set, default to every reachable host (network.allowedDomains).
+      // injectHosts is an *optional narrowing*, not a required allowlist.
+      // Trade-off: a masked credential with no injectHosts is injectable
+      // at every host the sandbox can reach — narrow it explicitly when
+      // the credential should only go to a subset.
+      const injectHosts =
+        v.injectHosts ?? credentials.injectHosts ?? allowedDomains ?? []
       setEnvVars[v.name] = sentinelRegistry.register(v.name, real, injectHosts)
     }
   }
@@ -644,7 +650,10 @@ function getFsReadConfig(): FsReadRestrictionConfig {
   const rawDenyRead = [
     ...new Set([
       ...config.filesystem.denyRead,
-      ...getCredentialRestrictions(config.credentials).denyReadPaths,
+      ...getCredentialRestrictions(
+        config.credentials,
+        config.network.allowedDomains,
+      ).denyReadPaths,
     ]),
   ]
 
@@ -868,6 +877,7 @@ async function wrapWithSandbox(
   // replacing it — so explicit filesystem restrictions always survive.
   const credentialRestrictions = getCredentialRestrictions(
     customConfig?.credentials ?? config?.credentials,
+    customConfig?.network?.allowedDomains ?? config?.network?.allowedDomains,
   )
   const rawDenyRead = [
     ...new Set([
