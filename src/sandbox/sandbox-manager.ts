@@ -560,30 +560,43 @@ function checkDependencies(ripgrepConfig?: {
 }
 
 /**
- * Build the read-deny / env-unset sets implied by the `credentials` config.
+ * Build the read-deny / env-unset / env-set maps implied by the
+ * `credentials` config.
  *
  * Only explicitly declared sources are restricted: `mode: 'deny'` file
- * entries join the read-deny set and `mode: 'deny'` env vars are unset.
- * The mode filter keeps the structure ready for future non-deny modes
- * (e.g. masking).
+ * entries join the read-deny set, `mode: 'deny'` env vars are unset, and
+ * `mode: 'mask'` env vars are set to a per-session sentinel registered in
+ * {@link sentinelRegistry}. A masked var with no value in the host
+ * environment is skipped — there is nothing to protect, and emitting an
+ * unset var would change tool behaviour (presence checks would pass where
+ * they didn't before).
  */
 function getCredentialRestrictions(
   credentials: CredentialsConfig | undefined,
 ): CredentialRestrictionConfig {
   if (!credentials) {
-    return { denyReadPaths: [], unsetEnvVars: [] }
+    return { denyReadPaths: [], unsetEnvVars: [], setEnvVars: {} }
   }
 
   const files = credentials.files ?? []
   const denyReadPaths = files.filter(f => f.mode === 'deny').map(f => f.path)
 
-  const unsetEnvVars = (credentials.envVars ?? [])
-    .filter(v => v.mode === 'deny')
-    .map(v => v.name)
+  const unsetEnvVars: string[] = []
+  const setEnvVars: Record<string, string> = {}
+  for (const { name, mode } of credentials.envVars ?? []) {
+    if (mode === 'deny') {
+      unsetEnvVars.push(name)
+    } else if (mode === 'mask') {
+      const real = process.env[name]
+      if (real === undefined) continue
+      setEnvVars[name] = sentinelRegistry.register(real)
+    }
+  }
 
   return {
     denyReadPaths: [...new Set(denyReadPaths)],
     unsetEnvVars: [...new Set(unsetEnvVars)],
+    setEnvVars,
   }
 }
 
@@ -902,6 +915,7 @@ async function wrapWithSandbox(
         readConfig,
         writeConfig,
         unsetEnvVars: credentialRestrictions.unsetEnvVars,
+        setEnvVars: credentialRestrictions.setEnvVars,
         allowUnixSockets: getAllowUnixSockets(),
         allowAllUnixSockets: getAllowAllUnixSockets(),
         allowLocalBinding: getAllowLocalBinding(),
@@ -936,6 +950,7 @@ async function wrapWithSandbox(
         readConfig,
         writeConfig,
         unsetEnvVars: credentialRestrictions.unsetEnvVars,
+        setEnvVars: credentialRestrictions.setEnvVars,
         enableWeakerNestedSandbox: getEnableWeakerNestedSandbox(),
         allowAllUnixSockets: getAllowAllUnixSockets(),
         binShell,
