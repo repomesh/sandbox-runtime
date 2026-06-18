@@ -414,9 +414,14 @@ describe('Config Validation', () => {
     test('accepts mode "mask" for env vars when tlsTerminate is enabled', () => {
       const result = SandboxRuntimeConfigSchema.safeParse({
         ...base,
-        network: { ...base.network, tlsTerminate: {} },
+        network: {
+          allowedDomains: ['api.github.com'],
+          deniedDomains: [],
+          tlsTerminate: {},
+        },
         credentials: {
           envVars: [{ name: 'GH_TOKEN', mode: 'mask' }],
+          injectHosts: ['api.github.com'],
         },
       })
       expect(result.success).toBe(true)
@@ -425,8 +430,10 @@ describe('Config Validation', () => {
     test('rejects mode "mask" for env vars without tlsTerminate', () => {
       const result = SandboxRuntimeConfigSchema.safeParse({
         ...base,
+        network: { allowedDomains: ['api.github.com'], deniedDomains: [] },
         credentials: {
           envVars: [{ name: 'GH_TOKEN', mode: 'mask' }],
+          injectHosts: ['api.github.com'],
         },
       })
       expect(result.success).toBe(false)
@@ -440,9 +447,142 @@ describe('Config Validation', () => {
     test('allowPlaintextInject permits mask without tlsTerminate', () => {
       const result = SandboxRuntimeConfigSchema.safeParse({
         ...base,
+        network: { allowedDomains: ['api.github.com'], deniedDomains: [] },
         credentials: {
           envVars: [{ name: 'GH_TOKEN', mode: 'mask' }],
+          injectHosts: ['api.github.com'],
           allowPlaintextInject: true,
+        },
+      })
+      expect(result.success).toBe(true)
+    })
+
+    test('rejects a masked env var with no effective injectHosts', () => {
+      // Neither per-entry nor block-level — the credential would be masked
+      // but never injected anywhere.
+      const result = SandboxRuntimeConfigSchema.safeParse({
+        ...base,
+        network: { ...base.network, tlsTerminate: {} },
+        credentials: {
+          envVars: [{ name: 'GH_TOKEN', mode: 'mask' }],
+        },
+      })
+      expect(result.success).toBe(false)
+      if (!result.success) {
+        const issue = result.error.issues.find(
+          i => i.path.join('.') === 'credentials.envVars.0',
+        )
+        expect(issue?.message).toContain('requires injectHosts')
+        expect(issue?.message).toContain('masked but never injected')
+      }
+    })
+
+    test('rejects a masked env var whose per-entry injectHosts is empty', () => {
+      const result = SandboxRuntimeConfigSchema.safeParse({
+        ...base,
+        network: {
+          allowedDomains: ['api.github.com'],
+          deniedDomains: [],
+          tlsTerminate: {},
+        },
+        credentials: {
+          envVars: [{ name: 'GH_TOKEN', mode: 'mask', injectHosts: [] }],
+          injectHosts: ['api.github.com'],
+        },
+      })
+      // An explicit empty list is an override, not "inherit", so it fails
+      // the non-empty check.
+      expect(result.success).toBe(false)
+      if (!result.success) {
+        const messages = result.error.issues.map(i => i.message).join('\n')
+        expect(messages).toContain('requires injectHosts')
+      }
+    })
+
+    test('a masked env var inherits block-level injectHosts when it has none', () => {
+      const result = SandboxRuntimeConfigSchema.safeParse({
+        ...base,
+        network: {
+          allowedDomains: ['api.github.com'],
+          deniedDomains: [],
+          tlsTerminate: {},
+        },
+        credentials: {
+          envVars: [{ name: 'GH_TOKEN', mode: 'mask' }],
+          injectHosts: ['api.github.com'],
+        },
+      })
+      expect(result.success).toBe(true)
+    })
+
+    test('per-entry injectHosts satisfies the requirement without a block-level default', () => {
+      const result = SandboxRuntimeConfigSchema.safeParse({
+        ...base,
+        network: {
+          allowedDomains: ['registry.npmjs.org'],
+          deniedDomains: [],
+          tlsTerminate: {},
+        },
+        credentials: {
+          envVars: [
+            {
+              name: 'NPM_TOKEN',
+              mode: 'mask',
+              injectHosts: ['registry.npmjs.org'],
+            },
+          ],
+        },
+      })
+      expect(result.success).toBe(true)
+    })
+
+    test('rejects per-entry injectHosts not present in allowedDomains', () => {
+      const result = SandboxRuntimeConfigSchema.safeParse({
+        ...base,
+        network: {
+          allowedDomains: ['api.github.com'],
+          deniedDomains: [],
+          tlsTerminate: {},
+        },
+        credentials: {
+          envVars: [
+            {
+              name: 'NPM_TOKEN',
+              mode: 'mask',
+              injectHosts: ['registry.npmjs.org'],
+            },
+          ],
+        },
+      })
+      expect(result.success).toBe(false)
+      if (!result.success) {
+        const issue = result.error.issues.find(i =>
+          i.path.join('.').startsWith('credentials.envVars.0.injectHosts'),
+        )
+        expect(issue?.message).toContain('registry.npmjs.org')
+        expect(issue?.message).toContain('network.allowedDomains')
+      }
+    })
+
+    test('rejects overly-broad wildcards in per-entry injectHosts', () => {
+      const result = SandboxRuntimeConfigSchema.safeParse({
+        ...base,
+        network: { ...base.network, tlsTerminate: {} },
+        credentials: {
+          envVars: [{ name: 'GH_TOKEN', mode: 'mask', injectHosts: ['*.com'] }],
+        },
+      })
+      expect(result.success).toBe(false)
+    })
+
+    test('injectHosts on a deny-mode entry is accepted (ignored)', () => {
+      const result = SandboxRuntimeConfigSchema.safeParse({
+        ...base,
+        network: { allowedDomains: ['api.github.com'], deniedDomains: [] },
+        credentials: {
+          envVars: [
+            { name: 'GH_TOKEN', mode: 'deny', injectHosts: ['api.github.com'] },
+          ],
         },
       })
       expect(result.success).toBe(true)

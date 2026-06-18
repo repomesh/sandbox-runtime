@@ -614,18 +614,16 @@ function getCredentialRestrictions(
 
   const unsetEnvVars: string[] = []
   const setEnvVars: Record<string, string> = {}
-  const defaultInjectHosts = credentials.injectHosts ?? []
   for (const v of credentials.envVars ?? []) {
     if (v.mode === 'deny') {
       unsetEnvVars.push(v.name)
     } else if (v.mode === 'mask') {
       const real = process.env[v.name]
       if (real === undefined) continue
-      setEnvVars[v.name] = sentinelRegistry.register(
-        v.name,
-        real,
-        defaultInjectHosts,
-      )
+      // A per-entry injectHosts overrides the block-level default; the
+      // schema guarantees at least one of them is non-empty.
+      const injectHosts = v.injectHosts ?? credentials.injectHosts ?? []
+      setEnvVars[v.name] = sentinelRegistry.register(v.name, real, injectHosts)
     }
   }
 

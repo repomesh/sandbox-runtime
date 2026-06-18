@@ -372,9 +372,12 @@ describe.if(isLinux)('env masking on Linux (bwrap)', () => {
     await SandboxManager.reset()
     await SandboxManager.initialize(
       baseConfig({
+        // injectHosts is unused (this block tests env-side masking only)
+        // but required by the schema for any masked env var.
+        network: { allowedDomains: ['localhost'], deniedDomains: [] },
         credentials: {
           envVars: [{ name: MASKED_VAR, mode: 'mask' }],
-          // No injectHosts here — this block tests env-side masking only.
+          injectHosts: ['localhost'],
           allowPlaintextInject: true,
         },
       }),
@@ -402,8 +405,10 @@ describe.if(isLinux)('env masking on Linux (bwrap)', () => {
     await SandboxManager.reset()
     await SandboxManager.initialize(
       baseConfig({
+        network: { allowedDomains: ['localhost'], deniedDomains: [] },
         credentials: {
           envVars: [{ name: 'SRT_TEST_NEVER_SET', mode: 'mask' }],
+          injectHosts: ['localhost'],
           allowPlaintextInject: true,
         },
       }),
@@ -416,8 +421,10 @@ describe.if(isLinux)('env masking on Linux (bwrap)', () => {
     process.env[MASKED_VAR] = REAL_TOKEN
     await SandboxManager.initialize(
       baseConfig({
+        network: { allowedDomains: ['localhost'], deniedDomains: [] },
         credentials: {
           envVars: [{ name: MASKED_VAR, mode: 'mask' }],
+          injectHosts: ['localhost'],
           allowPlaintextInject: true,
         },
       }),
@@ -447,8 +454,10 @@ describe.if(isLinux)('env masking on Linux (bwrap)', () => {
     process.env[MASKED_VAR] = REAL_TOKEN
     await SandboxManager.initialize(
       baseConfig({
+        network: { allowedDomains: ['localhost'], deniedDomains: [] },
         credentials: {
           envVars: [{ name: MASKED_VAR, mode: 'mask' }],
+          injectHosts: ['localhost'],
           allowPlaintextInject: true,
         },
       }),
@@ -571,6 +580,130 @@ describe.if(isLinux)('end-to-end credential masking via SandboxManager', () => {
     expect(r.exit).toBe(0)
     expect(lastHeaders?.authorization).toBe(`Bearer ${sentinel}`)
     expect(lastHeaders?.authorization).not.toContain(REAL_TOKEN)
+  }, 20000)
+})
+
+/**
+ * Per-credential injectHosts through SandboxManager: GH_TOKEN inherits the
+ * block-level default (localhost), NPM_TOKEN overrides with its own host.
+ * Each sentinel only swaps at its own credential's effective injectHosts —
+ * sending GH_TOKEN's sentinel to NPM_TOKEN's host (or vice versa) must NOT
+ * substitute, even though both hosts are allowlisted.
+ */
+describe.if(isLinux)('per-credential injectHosts via SandboxManager', () => {
+  const GH_VAR = 'SRT_TEST_GH_TOKEN'
+  const NPM_VAR = 'SRT_TEST_NPM_TOKEN'
+  const GH_REAL = 'gh-real-secret'
+  const NPM_REAL = 'npm-real-secret'
+
+  // Two upstreams, two hostnames that both resolve to 127.0.0.1: the
+  // proxy distinguishes them by the absolute-URI host on the plain-HTTP
+  // path, which is what destHost gating sees.
+  const GH_HOST = 'localhost'
+  const NPM_HOST = 'localtest.me'
+
+  let ghUp: Server, ghPort: number, ghHeaders: IncomingHttpHeaders | undefined
+  let npmUp: Server,
+    npmPort: number,
+    npmHeaders: IncomingHttpHeaders | undefined
+  let ghSentinel: string, npmSentinel: string
+  let proxyPort: number, authToken: string
+
+  beforeAll(async () => {
+    ghUp = createHttpServer((req, res) => {
+      ghHeaders = req.headers
+      res.writeHead(200)
+      res.end('ok')
+    })
+    npmUp = createHttpServer((req, res) => {
+      npmHeaders = req.headers
+      res.writeHead(200)
+      res.end('ok')
+    })
+    await new Promise<void>(r => ghUp.listen(0, '127.0.0.1', () => r()))
+    await new Promise<void>(r => npmUp.listen(0, '127.0.0.1', () => r()))
+    ghPort = (ghUp.address() as AddressInfo).port
+    npmPort = (npmUp.address() as AddressInfo).port
+
+    process.env[GH_VAR] = GH_REAL
+    process.env[NPM_VAR] = NPM_REAL
+    await SandboxManager.reset()
+    await SandboxManager.initialize({
+      network: { allowedDomains: [GH_HOST, NPM_HOST], deniedDomains: [] },
+      filesystem: { denyRead: [], allowWrite: ['/tmp'], denyWrite: [] },
+      credentials: {
+        // GH_TOKEN inherits the block-level default; NPM_TOKEN overrides.
+        envVars: [
+          { name: GH_VAR, mode: 'mask' },
+          { name: NPM_VAR, mode: 'mask', injectHosts: [NPM_HOST] },
+        ],
+        injectHosts: [GH_HOST],
+        allowPlaintextInject: true,
+      },
+    })
+    await SandboxManager.wrapWithSandbox('true')
+    const reg = SandboxManager.getSentinelRegistry()
+    ghSentinel = [...reg.entries()].find(([, r]) => r === GH_REAL)![0]
+    npmSentinel = [...reg.entries()].find(([, r]) => r === NPM_REAL)![0]
+    proxyPort = SandboxManager.getProxyPort()!
+    authToken = SandboxManager.getProxyAuthToken()!
+  })
+
+  afterAll(async () => {
+    await SandboxManager.reset()
+    delete process.env[GH_VAR]
+    delete process.env[NPM_VAR]
+    await new Promise<void>(r => ghUp.close(() => r()))
+    await new Promise<void>(r => npmUp.close(() => r()))
+  })
+
+  test('two masked vars register two distinct sentinels', () => {
+    expect(ghSentinel).not.toBe(npmSentinel)
+    expect(SandboxManager.getSentinelRegistry().size).toBe(2)
+  })
+
+  test('inherited block-level host swaps the GH sentinel', async () => {
+    ghHeaders = undefined
+    const r = await curlViaProxy(proxyPort, `http://${GH_HOST}:${ghPort}/`, {
+      headers: ['Authorization: Bearer ' + ghSentinel],
+      proxyAuth: `srt:${authToken}`,
+    })
+    expect(r.exit).toBe(0)
+    expect(ghHeaders?.authorization).toBe(`Bearer ${GH_REAL}`)
+  }, 20000)
+
+  test('per-entry override swaps the NPM sentinel only at its own host', async () => {
+    npmHeaders = undefined
+    const r = await curlViaProxy(proxyPort, `http://${NPM_HOST}:${npmPort}/`, {
+      headers: ['Authorization: Bearer ' + npmSentinel],
+      proxyAuth: `srt:${authToken}`,
+      resolve: `${NPM_HOST}:${npmPort}:127.0.0.1`,
+    })
+    expect(r.exit).toBe(0)
+    expect(npmHeaders?.authorization).toBe(`Bearer ${NPM_REAL}`)
+
+    // The block-level default does NOT apply to an entry with its own
+    // injectHosts: NPM's sentinel sent to GH_HOST stays a fake.
+    ghHeaders = undefined
+    const r2 = await curlViaProxy(proxyPort, `http://${GH_HOST}:${ghPort}/`, {
+      headers: ['Authorization: Bearer ' + npmSentinel],
+      proxyAuth: `srt:${authToken}`,
+    })
+    expect(r2.exit).toBe(0)
+    expect(ghHeaders?.authorization).toBe(`Bearer ${npmSentinel}`)
+    expect(ghHeaders?.authorization).not.toContain(NPM_REAL)
+  }, 20000)
+
+  test("anti-laundering: GH sentinel sent to NPM's host is not swapped", async () => {
+    npmHeaders = undefined
+    const r = await curlViaProxy(proxyPort, `http://${NPM_HOST}:${npmPort}/`, {
+      headers: ['Authorization: Bearer ' + ghSentinel],
+      proxyAuth: `srt:${authToken}`,
+      resolve: `${NPM_HOST}:${npmPort}:127.0.0.1`,
+    })
+    expect(r.exit).toBe(0)
+    expect(npmHeaders?.authorization).toBe(`Bearer ${ghSentinel}`)
+    expect(npmHeaders?.authorization).not.toContain(GH_REAL)
   }, 20000)
 })
 
