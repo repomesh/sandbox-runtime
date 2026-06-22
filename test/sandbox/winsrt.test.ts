@@ -15,6 +15,7 @@ import {
   uninstallWindowsSandbox,
   deleteWindowsGroup,
   wrapCommandWithSandboxWindows,
+  parseWindowsBinShell,
   DEFAULT_WINDOWS_PROXY_PORT_RANGE,
 } from '../../src/sandbox/windows-sandbox-utils.js'
 
@@ -229,44 +230,42 @@ describe.if(isWindows)('Windows sandbox: srt-win helpers', () => {
     expect(gs.state).toBe('absent')
   })
 
-  it('wrapCommandWithSandboxWindows: binShell=bash path → [bash, -c, cmd] (not cmd.exe)', () => {
-    // The bash branch treats binShell as the literal exe to invoke
-    // (Git Bash has no fixed install path), matched on basename only.
-    // The command string — bash metachars and all — must land as the
-    // single argv element after `-c`, untouched.
+  it('wrapCommandWithSandboxWindows: binShell={kind:bash} → [path, -c, cmd] (not cmd.exe)', () => {
+    // The bash arm treats binShell.path as the literal exe to invoke
+    // (Git Bash has no fixed install path). The command string — bash
+    // metachars and all — must land as the single argv element after
+    // `-c`, untouched.
     const cmd = `echo 'a b' && printf '%s' x | cat`
-    for (const bashPath of [
+    const bashPath = 'C:\\Program Files\\Git\\bin\\bash.exe'
+    const { argv } = wrapCommandWithSandboxWindows({
+      command: cmd,
+      group: { groupSid: ADMINS_SID },
+      binShell: { kind: 'bash', path: bashPath },
+    })
+    expect(argv.slice(-3)).toEqual([bashPath, '-c', cmd])
+    expect(argv).not.toContain('/c')
+    expect(argv.join(' ')).not.toMatch(/cmd\.exe/i)
+  })
+
+  it('parseWindowsBinShell: maps tokens/paths and rejects the rest', () => {
+    expect(parseWindowsBinShell(undefined)).toEqual({ kind: 'cmd' })
+    expect(parseWindowsBinShell('cmd')).toEqual({ kind: 'cmd' })
+    expect(parseWindowsBinShell('pwsh')).toEqual({ kind: 'pwsh' })
+    expect(parseWindowsBinShell('PowerShell')).toEqual({ kind: 'powershell' })
+    for (const p of [
       'C:\\Program Files\\Git\\bin\\bash.exe',
       'C:\\Program Files\\Git\\usr\\bin\\bash.exe',
       'C:\\Program Files\\Git\\bin\\sh.exe',
     ]) {
-      const { argv } = wrapCommandWithSandboxWindows({
-        command: cmd,
-        group: { groupSid: ADMINS_SID },
-        binShell: bashPath,
-      })
-      expect(argv.slice(-3)).toEqual([bashPath, '-c', cmd])
-      expect(argv).not.toContain('/c')
-      expect(argv.join(' ')).not.toMatch(/cmd\.exe/i)
+      expect(parseWindowsBinShell(p)).toEqual({ kind: 'bash', path: p })
     }
-  })
-
-  it('wrapCommandWithSandboxWindows: rejects relative bash path and unknown shells', () => {
-    const base = { command: 'true', group: { groupSid: ADMINS_SID } }
     // Bare/relative bash token: caller must pass the resolved absolute
     // install path (PATH-resolved 'bash' could be WSL, not Git Bash).
-    expect(() =>
-      wrapCommandWithSandboxWindows({ ...base, binShell: 'bash' }),
-    ).toThrow(/absolute/)
+    expect(() => parseWindowsBinShell('bash')).toThrow(/absolute/)
     // Unknown values fail loud rather than silently routing to cmd.exe.
+    expect(() => parseWindowsBinShell('zsh')).toThrow(/unrecognised binShell/)
     expect(() =>
-      wrapCommandWithSandboxWindows({ ...base, binShell: 'zsh' }),
-    ).toThrow(/unrecognised binShell/)
-    expect(() =>
-      wrapCommandWithSandboxWindows({
-        ...base,
-        binShell: 'C:\\Program Files\\Git\\git-bash.exe',
-      }),
+      parseWindowsBinShell('C:\\Program Files\\Git\\git-bash.exe'),
     ).toThrow(/unrecognised binShell/)
   })
 
