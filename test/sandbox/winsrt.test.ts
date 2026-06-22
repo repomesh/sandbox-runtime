@@ -238,7 +238,7 @@ describe.if(isWindows)('Windows sandbox: srt-win helpers', () => {
     for (const bashPath of [
       'C:\\Program Files\\Git\\bin\\bash.exe',
       'C:\\Program Files\\Git\\usr\\bin\\bash.exe',
-      'bash',
+      'C:\\Program Files\\Git\\bin\\sh.exe',
     ]) {
       const { argv } = wrapCommandWithSandboxWindows({
         command: cmd,
@@ -249,6 +249,25 @@ describe.if(isWindows)('Windows sandbox: srt-win helpers', () => {
       expect(argv).not.toContain('/c')
       expect(argv.join(' ')).not.toMatch(/cmd\.exe/i)
     }
+  })
+
+  it('wrapCommandWithSandboxWindows: rejects relative bash path and unknown shells', () => {
+    const base = { command: 'true', group: { groupSid: ADMINS_SID } }
+    // Bare/relative bash token: caller must pass the resolved absolute
+    // install path (PATH-resolved 'bash' could be WSL, not Git Bash).
+    expect(() =>
+      wrapCommandWithSandboxWindows({ ...base, binShell: 'bash' }),
+    ).toThrow(/absolute/)
+    // Unknown values fail loud rather than silently routing to cmd.exe.
+    expect(() =>
+      wrapCommandWithSandboxWindows({ ...base, binShell: 'zsh' }),
+    ).toThrow(/unrecognised binShell/)
+    expect(() =>
+      wrapCommandWithSandboxWindows({
+        ...base,
+        binShell: 'C:\\Program Files\\Git\\git-bash.exe',
+      }),
+    ).toThrow(/unrecognised binShell/)
   })
 
   it('getWindowsWfpStatus reports absent for a never-installed sublayer', () => {
@@ -780,13 +799,13 @@ describe.if(isWindows)('Windows sandbox: SandboxManager network', () => {
       // --noproxy strip forces a direct connect; WFP filter-3 must
       // refuse it exactly as it does for cmd (cf. C4).
       SandboxManager.updateConfig(createTestConfig(['example.com']))
+      const cmd = `curl --noproxy '*' -sS -m 5 https://example.com`
       const { argv, env } = await SandboxManager.wrapWithSandboxArgv(
-        `curl --noproxy '*' -sS -m 5 https://example.com`,
+        cmd,
         GIT_BASH,
       )
       // Sanity: routed via the bash branch, not cmd.
-      expect(argv.slice(-3)[0]).toBe(GIT_BASH)
-      expect(argv.slice(-3)[1]).toBe('-c')
+      expect(argv.slice(-3)).toEqual([GIT_BASH, '-c', cmd])
       const r = await spawnAsync(argv[0], argv.slice(1), {
         timeout: 20_000,
         env,

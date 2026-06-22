@@ -78,16 +78,19 @@ export interface WindowsSandboxParams {
    *     mapped to a fixed well-known executable inside
    *     {@link wrapCommandWithSandboxWindows}.
    *
-   *   • a path whose basename is `bash` / `bash.exe` → the **actual
-   *     path to exec**. Git Bash has no fixed install location, so the
-   *     caller passes the resolved path. The path is taken as-is and
-   *     MUST originate from trusted host configuration (user settings
+   *   • an absolute path whose basename is `bash` / `bash.exe` /
+   *     `sh` / `sh.exe` → the **actual path to exec**. Git Bash has
+   *     no fixed install location, so the caller passes the resolved
+   *     path. The path MUST be absolute and MUST originate from
+   *     trusted host configuration (user settings
    *     / install detection), NEVER from workspace or repository
    *     content. Callers reach here via `SandboxManager` only, and the
    *     inner shell runs INSIDE the restricted-token sandbox
    *     regardless, so an unexpected path is not a sandbox-escape
    *     vector — but it would still be an arbitrary-exec footgun if
    *     sourced from untrusted input.
+   *
+   * Any other value throws — there is no silent fallback to cmd.exe.
    *
    * The child's post-`/c` (or post-`-c`) content is **passthrough** —
    * `&` chains, `"…"`/`'…'` quotes exactly as written. The security
@@ -480,10 +483,16 @@ export function wrapCommandWithSandboxWindows(p: WindowsSandboxParams): {
 
   const systemRoot = process.env.SystemRoot ?? 'C:\\Windows'
   // See `WindowsSandboxParams.binShell` for the token-vs-path duality.
+  // Dispatch is on basename only — keeps the powershell match from
+  // accidentally substring-matching a directory component of a path.
   const rawShell = p.binShell ?? 'cmd'
-  const shell = rawShell.toLowerCase()
   const shellBase = path.basename(rawShell).toLowerCase()
-  if (shellBase === 'bash' || shellBase === 'bash.exe') {
+  if (
+    shellBase === 'bash' ||
+    shellBase === 'bash.exe' ||
+    shellBase === 'sh' ||
+    shellBase === 'sh.exe'
+  ) {
     // Git Bash: invoke the caller-supplied path directly with
     // `-c <command>`. `command` is a fully-assembled bash command
     // string with its own internal quoting; srt-win's `build_cmdline`
@@ -492,10 +501,21 @@ export function wrapCommandWithSandboxWindows(p: WindowsSandboxParams): {
     // TODO: MSYS2 derives POSIX /tmp from Windows TEMP/TMP itself;
     // revisit whether any extra TEMP/TMP normalisation is needed for
     // the bash inner shell under the restricted token.
+    if (!path.isAbsolute(rawShell)) {
+      throw new Error(
+        `binShell bash path must be absolute (got ${JSON.stringify(rawShell)}); ` +
+          `pass the resolved Git Bash install path`,
+      )
+    }
     argv.push(rawShell, '-c', p.command)
-  } else if (shell === 'pwsh' || shell.includes('powershell')) {
+  } else if (
+    shellBase === 'pwsh' ||
+    shellBase === 'pwsh.exe' ||
+    shellBase === 'powershell' ||
+    shellBase === 'powershell.exe'
+  ) {
     const psExe =
-      shell === 'pwsh'
+      shellBase === 'pwsh' || shellBase === 'pwsh.exe'
         ? 'pwsh.exe'
         : path.join(
             systemRoot,
@@ -505,7 +525,7 @@ export function wrapCommandWithSandboxWindows(p: WindowsSandboxParams): {
             'powershell.exe',
           )
     argv.push(psExe, '-NoProfile', '-Command', p.command)
-  } else {
+  } else if (shellBase === 'cmd' || shellBase === 'cmd.exe') {
     // cmd /d (no AutoRun) /s (strip first+last quote of post-/c by
     // position) /c (run-then-exit). The `command` string lands as a
     // single argv element; srt-win's build_cmdline wraps it in one
@@ -516,6 +536,11 @@ export function wrapCommandWithSandboxWindows(p: WindowsSandboxParams): {
       '/s',
       '/c',
       p.command,
+    )
+  } else {
+    throw new Error(
+      `unrecognised binShell ${JSON.stringify(p.binShell)}: expected ` +
+        `'cmd' | 'powershell' | 'pwsh' or an absolute path to bash.exe/sh.exe`,
     )
   }
 
