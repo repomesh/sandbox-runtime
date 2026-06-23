@@ -140,7 +140,20 @@ export function buildMaskedFileBinds(
         )
         continue
       }
-      content = fs.readFileSync(realPath, 'utf8')
+      // Read as bytes first: a utf8 read silently maps invalid sequences
+      // to U+FFFD, so the sentinel would round-trip to corrupted bytes at
+      // the proxy. Whole-file masking is for token files; reject binary.
+      const raw = fs.readFileSync(realPath)
+      content = raw.toString('utf8')
+      if (Buffer.byteLength(content, 'utf8') !== raw.length) {
+        logForDebugging(
+          `[credential-mask] Skipping masked file with non-UTF-8 content ` +
+            `(binary credential files are not supported in whole-file ` +
+            `mask mode): ${f.path}`,
+          { level: 'warn' },
+        )
+        continue
+      }
     } catch (err) {
       logForDebugging(
         `[credential-mask] Skipping masked file (unreadable on host): ` +
