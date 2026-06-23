@@ -39,6 +39,12 @@ export interface MacOSSandboxParams {
   unsetEnvVars?: string[]
   /** Environment variables to set for the sandboxed child (env NAME=VALUE) */
   setEnvVars?: Record<string, string>
+  /**
+   * Whole-file credential masks. SBPL cannot redirect reads, so on macOS
+   * these degrade to read-deny on realPath until the DYLD interposer
+   * lands. fakePath is unused here.
+   */
+  maskedFileBinds?: Array<{ realPath: string; fakePath: string }>
   ignoreViolations?: IgnoreViolationsConfig | undefined
   allowPty?: boolean
   allowGitConfig?: boolean

@@ -49,6 +49,11 @@ export interface LinuxSandboxParams {
   unsetEnvVars?: string[]
   /** Environment variables to set inside the sandbox (bwrap --setenv NAME VALUE) */
   setEnvVars?: Record<string, string>
+  /**
+   * Whole-file credential masks: bind fakePath (sentinel content) over
+   * realPath read-only so the sandbox reads the sentinel.
+   */
+  maskedFileBinds?: Array<{ realPath: string; fakePath: string }>
   enableWeakerNestedSandbox?: boolean
   allowAllUnixSockets?: boolean
   binShell?: string
