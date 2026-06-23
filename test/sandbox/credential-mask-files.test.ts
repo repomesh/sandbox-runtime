@@ -2,10 +2,12 @@ import { describe, test, expect, beforeAll, afterAll } from 'bun:test'
 import { spawn, spawnSync } from 'node:child_process'
 import {
   existsSync,
+  lstatSync,
   mkdirSync,
   readdirSync,
   readFileSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from 'node:fs'
 import {
@@ -71,14 +73,23 @@ describe('MaskedFileStore', () => {
     store.dispose()
   })
 
-  test('store dir is outside the default sandbox-writable temp', () => {
-    // The default writable temp inside the sandbox is /tmp/claude (see
-    // getDefaultWritePaths). The fake dir must NOT be under it, or the
-    // sandboxed process could tamper with the sentinel source.
+  test('write does not follow a symlink planted at the fake path', () => {
+    // Cross-invocation attack: if a prior sandbox run could write the
+    // store dir, it could leave `ln -s <victim> 0.fake` behind and the
+    // next host-side write() would clobber <victim>. write() must unlink
+    // first so the sentinel lands in a fresh regular file.
     const store = new MaskedFileStore()
-    store.write('k', 'x')
-    expect(store.dirPath!.startsWith('/tmp/claude/')).toBe(false)
-    expect(store.dirPath!.startsWith('/private/tmp/claude/')).toBe(false)
+    const fake = store.write('k', 'first')
+    const victim = join(FIXTURE_DIR, 'symlink-victim')
+    writeFileSync(victim, 'victim-bytes')
+    rmSync(fake)
+    symlinkSync(victim, fake)
+
+    store.write('k', 'second')
+
+    expect(readFileSync(victim, 'utf8')).toBe('victim-bytes')
+    expect(lstatSync(fake).isSymbolicLink()).toBe(false)
+    expect(readFileSync(fake, 'utf8')).toBe('second')
     store.dispose()
   })
 
@@ -271,6 +282,26 @@ describe('buildMaskedFileBinds', () => {
       store,
     )
     expect(binds).toHaveLength(0)
+    expect(reg.size).toBe(0)
+    store.dispose()
+  })
+
+  test('skips a masked file with non-UTF-8 content', () => {
+    // 0xFF is never valid in UTF-8. A utf8 read would silently replace it
+    // with U+FFFD and the proxy would inject corrupted bytes; we skip
+    // instead so the misconfiguration surfaces.
+    const binFile = join(FIXTURE_DIR, 'binary-cred')
+    writeFileSync(binFile, Buffer.from([0x67, 0x68, 0x70, 0x5f, 0xff, 0xfe]))
+    const reg = new SentinelRegistry()
+    const store = new MaskedFileStore()
+    const { binds, degradeToDenyPaths } = buildMaskedFileBinds(
+      [{ path: binFile, mode: 'mask' }],
+      [],
+      reg,
+      store,
+    )
+    expect(binds).toHaveLength(0)
+    expect(degradeToDenyPaths).toHaveLength(0)
     expect(reg.size).toBe(0)
     store.dispose()
   })
@@ -640,6 +671,17 @@ describe.if(isLinux)('file masking on Linux (bwrap)', () => {
       const dir = SandboxManager.getMaskedFileStore().dirPath!
       expect(readdirSync(dir)).toHaveLength(1)
     })
+
+    test('emits --ro-bind <storeDir> <storeDir> after the allowWrite binds', async () => {
+      const wrapped = await SandboxManager.wrapWithSandbox('true')
+      const storeDir = SandboxManager.getMaskedFileStore().dirPath!
+      // The store-dir ro-bind must overlay any allowWrite covering it,
+      // so it must appear after `--bind /tmp /tmp` in argv order.
+      const writeBind = wrapped.indexOf('--bind /tmp /tmp')
+      const storeBind = wrapped.indexOf(`--ro-bind ${storeDir} ${storeDir}`)
+      expect(writeBind).toBeGreaterThan(-1)
+      expect(storeBind).toBeGreaterThan(writeBind)
+    })
   })
 
   describe('integration', () => {
@@ -671,6 +713,31 @@ describe.if(isLinux)('file masking on Linux (bwrap)', () => {
       const result = runInSandbox(wrapped)
       expect(result.status).toBe(0)
       expect(result.stdout).toBe('control-ok')
+    })
+
+    test('the fake-file store dir is read-only inside the sandbox even under allowWrite', async () => {
+      // baseConfig() has allowWrite: ['/tmp'], which covers os.tmpdir()
+      // and therefore the store dir. The store-dir ro-bind must overlay
+      // it: writing the bind SOURCE from inside the sandbox must fail.
+      // (The earlier "masked file is read-only" test only covers the
+      // bind DEST.)
+      await SandboxManager.wrapWithSandbox('true')
+      const storeDir = SandboxManager.getMaskedFileStore().dirPath!
+      expect(storeDir.startsWith(tmpdir())).toBe(true)
+
+      const fake = join(storeDir, '0.fake')
+      const before = readFileSync(fake, 'utf8')
+      const overwrite = await SandboxManager.wrapWithSandbox(
+        `sh -c 'echo pwned > ${fake}'`,
+      )
+      expect(runInSandbox(overwrite).status).not.toBe(0)
+      expect(readFileSync(fake, 'utf8')).toBe(before)
+
+      const plant = await SandboxManager.wrapWithSandbox(
+        `ln -s /etc/passwd ${join(storeDir, 'evil')}`,
+      )
+      expect(runInSandbox(plant).status).not.toBe(0)
+      expect(existsSync(join(storeDir, 'evil'))).toBe(false)
     })
   })
 

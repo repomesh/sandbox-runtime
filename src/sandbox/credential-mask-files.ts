@@ -128,14 +128,13 @@ export interface MaskedFileBind {
 /**
  * Manager-owned temp dir holding the fake files.
  *
- * INVARIANT: this directory must live OUTSIDE every sandbox write path. The
- * sandbox is `--ro-bind / /` with writable binds layered on top
- * (getDefaultWritePaths() + the caller's allowWrite). os.tmpdir() is fine —
- * the default writable temp is `/tmp/claude`, not `/tmp` itself, and the
- * caller would have to explicitly allowWrite os.tmpdir() to break this. If
- * the sandbox could write the fake file, it could replace the sentinel and
- * the bind would no longer guarantee the real content stays hidden (the
- * bind itself stays read-only, but the source file is what's exposed).
+ * INVARIANT: this directory must never be writable from inside the sandbox.
+ * The Linux layer enforces this by emitting `--ro-bind <dirPath> <dirPath>`
+ * after every other filesystem mount (see generateFilesystemArgs), so the
+ * store stays read-only even if a caller's allowWrite covers os.tmpdir() or
+ * the host's $TMPDIR points under a default-writable path. If the sandbox
+ * could write here it could replace a fake's content (the bind exposes the
+ * source file) or plant a symlink for a later host-side write() to follow.
  */
 export class MaskedFileStore {
   private dir: string | undefined
@@ -156,6 +155,10 @@ export class MaskedFileStore {
       fakePath = join(this.dir, `${this.byKey.size}.fake`)
       this.byKey.set(key, fakePath)
     }
+    // Never follow a symlink at fakePath: a prior sandbox invocation may
+    // have planted one (the store dir is ro-bound now, but defence in
+    // depth). Unlink first so writeFileSync creates a fresh regular file.
+    fs.rmSync(fakePath, { force: true })
     // 0600: owner rw so the idempotent rewrite above succeeds; the bind
     // into the sandbox is --ro-bind so the sandboxed process sees it
     // read-only regardless of the host mode. No group/other.
@@ -242,7 +245,21 @@ export function buildMaskedFileBinds(
         )
         continue
       }
-      content = fs.readFileSync(realPath, 'utf8')
+      // Read as bytes first: a utf8 read silently maps invalid sequences
+      // to U+FFFD, so the sentinel would round-trip to corrupted bytes at
+      // the proxy. Masking (whole-file or extract) is for text credential
+      // files; reject binary.
+      const raw = fs.readFileSync(realPath)
+      content = raw.toString('utf8')
+      if (Buffer.byteLength(content, 'utf8') !== raw.length) {
+        logForDebugging(
+          `[credential-mask] Skipping masked file with non-UTF-8 content ` +
+            `(binary credential files are not supported in mask mode): ` +
+            `${f.path}`,
+          { level: 'warn' },
+        )
+        continue
+      }
     } catch (err) {
       logForDebugging(
         `[credential-mask] Skipping masked file (unreadable on host): ` +

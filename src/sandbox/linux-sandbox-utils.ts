@@ -54,6 +54,11 @@ export interface LinuxSandboxParams {
    * realPath read-only so the sandbox reads the sentinel.
    */
   maskedFileBinds?: Array<{ realPath: string; fakePath: string }>
+  /**
+   * Host directory holding the fake files. Ro-bound over itself so the
+   * sandbox cannot write the bind sources even if allowWrite covers it.
+   */
+  maskedFileStoreDir?: string
   enableWeakerNestedSandbox?: boolean
   allowAllUnixSockets?: boolean
   binShell?: string
@@ -792,6 +797,7 @@ async function generateFilesystemArgs(
   readConfig: FsReadRestrictionConfig | undefined,
   writeConfig: FsWriteRestrictionConfig | undefined,
   maskedFileBinds: Array<{ realPath: string; fakePath: string }> | undefined,
+  maskedFileStoreDir: string | undefined,
   ripgrepConfig: { command: string; args?: string[] } = { command: 'rg' },
   mandatoryDenySearchDepth: number = DEFAULT_MANDATORY_DENY_SEARCH_DEPTH,
   allowGitConfig = false,
@@ -1078,10 +1084,11 @@ async function generateFilesystemArgs(
   // but the source is the sentinel-content fake instead of /dev/null.
   // realPath was already normalized (tilde-expanded, realpath'd) by the
   // caller; resolveSymlinkDenyDest covers the symlinked-credential case
-  // for the same reason as above. The fake file lives under os.tmpdir(),
-  // which is reachable read-only via the initial `--ro-bind / /` — no
-  // extra read-allow needed. Adding the dest to maskedFiles ensures a
-  // later denyWrite ro-bind over the same path doesn't undo the mask.
+  // for the same reason as above. The fake's parent dir is explicitly
+  // ro-bound at the end of this function, so the bind source is never
+  // writable from inside the sandbox. Adding the dest to maskedFiles
+  // ensures a later denyWrite ro-bind over the same path doesn't undo
+  // the mask.
   for (const { realPath, fakePath } of maskedFileBinds ?? []) {
     const dest = resolveSymlinkDenyDest(realPath)
     args.push('--ro-bind', fakePath, dest)
@@ -1158,6 +1165,16 @@ async function generateFilesystemArgs(
     }
   }
 
+  // INVARIANT: the fake-file store directory must never be writable from
+  // inside the sandbox. If it were, a sandboxed process could plant a
+  // symlink at a fake path and a later host-side write() would follow it,
+  // or replace a fake's content so the bind exposes attacker bytes. Emit
+  // last so it overlays any earlier --bind that covers the store dir
+  // (e.g. allowWrite: ['/tmp'] when the store is under os.tmpdir()).
+  if (maskedFileStoreDir !== undefined) {
+    args.push('--ro-bind', maskedFileStoreDir, maskedFileStoreDir)
+  }
+
   return args
 }
 
@@ -1226,6 +1243,7 @@ export async function wrapCommandWithSandboxLinux(
     unsetEnvVars,
     setEnvVars,
     maskedFileBinds,
+    maskedFileStoreDir,
     enableWeakerNestedSandbox,
     allowAllUnixSockets,
     binShell,
@@ -1384,6 +1402,7 @@ export async function wrapCommandWithSandboxLinux(
       readConfig,
       writeConfig,
       maskedFileBinds,
+      maskedFileStoreDir,
       ripgrepConfig,
       mandatoryDenySearchDepth,
       allowGitConfig,
