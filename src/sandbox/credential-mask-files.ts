@@ -63,9 +63,9 @@ export interface ExtractResult {
  * captured value replaced by its index placeholder.
  *
  * Returns `null` when the pattern matches nothing — the caller treats that
- * as fail-closed (degrade to `mode: "deny"`), because a non-matching
- * pattern is almost certainly a config mistake and binding the unmodified
- * real file would expose the credential it was meant to mask.
+ * as fail-open (skip the entry, leave the file readable as-is) with a loud
+ * stderr warning. A non-matching pattern is a config mistake for the
+ * operator to fix; see {@link buildMaskedFileBinds} for the rationale.
  *
  * Throws when a match has no group-1 capture. The schema already rejects
  * patterns with zero groups, so this only fires when group 1 is optional
@@ -192,9 +192,12 @@ export interface MaskedFileBuildResult {
   binds: MaskedFileBind[]
   /**
    * Resolved paths of `mode: "mask"` entries that degraded to deny at
-   * runtime — currently only the `extract`-with-no-match case. Callers
-   * union these into the read-deny set so the credential file is
-   * unreadable rather than exposed.
+   * runtime. Callers union these into the read-deny set.
+   *
+   * Currently always empty — the only runtime-degrade case (`extract`
+   * with no match) now fails open instead. Kept so a future
+   * `onExtractNoMatch: "warn" | "deny" | "error"` option can route to
+   * deny without re-plumbing the consumer in sandbox-manager.ts.
    */
   degradeToDenyPaths: string[]
 }
@@ -211,8 +214,11 @@ export interface MaskedFileBuildResult {
  * Structured mode (`extract` set): one sentinel per distinct captured
  * value, keyed `file:<path>#<i>`; the fake file is the real content with
  * each captured span replaced by its sentinel. If the regex matches
- * nothing the entry **degrades to deny** — fail-closed, because a wrong
- * pattern would otherwise bind the real file unmodified.
+ * nothing the entry is **skipped with a loud stderr warning** — fail-open:
+ * no bind, no deny, the file stays readable via the root mount. The
+ * operator's regex is treated as a config error to surface and fix, not a
+ * reason to block file access; a wrong pattern should not break a tool
+ * that needs the file when the credential is legitimately absent.
  *
  * Entries whose path does not exist, is unreadable, or resolves to a
  * directory are skipped with a debug log — same posture as a masked env
@@ -278,15 +284,17 @@ export function buildMaskedFileBinds(
     } else {
       const extracted = extractAndSubstitute(content, f.extract)
       if (extracted === null) {
-        // Fail-closed: a non-matching extract pattern must not result in
-        // the real file being bound unmodified. Degrade to deny so the
-        // sandboxed process cannot read the credential at all.
-        logForDebugging(
-          `[credential-mask] extract pattern /${f.extract}/ matched ` +
-            `nothing in ${f.path} — degrading to mode "deny".`,
-          { level: 'warn' },
-        )
-        degradeToDenyPaths.push(realPath)
+        // Fail-open: a non-matching extract pattern is a config error to
+        // surface, not a reason to block file access. Skip the entry (no
+        // bind, no deny) — the file stays readable via the root mount —
+        // and warn loudly on stderr so the operator fixes the regex.
+        const msg =
+          `[sandbox-runtime] WARNING: credentials.files entry ` +
+          `"${f.path}" has extract pattern "${f.extract}" that matched ` +
+          `nothing in the file. The file is left UNPROTECTED (readable ` +
+          `as-is inside the sandbox). Fix the regex or remove the entry.`
+        console.warn(msg)
+        logForDebugging(msg, { level: 'warn' })
         continue
       }
       fakeContent = extracted.fakeContent
