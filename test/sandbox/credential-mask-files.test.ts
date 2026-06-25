@@ -165,6 +165,20 @@ describe('extractAndSubstitute', () => {
     ).toThrow(/capture group 1/)
   })
 
+  test('only the regex-matched span is replaced; coincidental occurrences elsewhere are left intact', () => {
+    // The captured value `abc123` also appears in a comment line that the
+    // regex does not match. Offset-based replacement touches only group 1
+    // of each match, so the comment is preserved byte-for-byte. The old
+    // value-based pass would have rewritten both.
+    const content =
+      'oauth_token: abc123\n' + '# note: the token abc123 is stored above\n'
+    const out = extractAndSubstitute(content, 'oauth_token:\\s*(\\S+)', S)!
+    expect(out.captures).toEqual(['abc123'])
+    expect(out.fakeContent).toBe(
+      'oauth_token: <S0>\n' + '# note: the token abc123 is stored above\n',
+    )
+  })
+
   test('a capture that is a substring of another does not corrupt the longer one', () => {
     // tok is a prefix of tok-long; offset-based replacement touches only
     // each match's own group-1 span, so neither capture corrupts the other.
